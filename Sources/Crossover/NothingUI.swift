@@ -2,10 +2,63 @@ import AppKit
 import CoreText
 import SwiftUI
 
-enum ZoneColorRole: String, CaseIterable {
-    case connected = "CONNECTED"
-    case standby = "STANDBY"
-    case disconnected = "DISCONNECTED"
+enum ZoneColorRole: CaseIterable, Hashable {
+    case connected, disconnected
+
+    var label: String {
+        switch self {
+        case .connected: "Connected"
+        case .disconnected: "Disconnected"
+        }
+    }
+}
+
+struct PopoverTokens {
+    let background: Color
+    let mapSurface: Color
+    let textPrimary: Color
+    let textSecondary: Color
+    let textDisabled: Color
+    let border: Color
+    let hover: Color
+    let pressed: Color
+    let focus: Color
+    let actionBackground: Color
+    let actionText: Color
+    let connected: Color
+    let disconnected: Color
+    let clear: Color
+    let display: Font
+    let body: Font
+    let bodySmall: Font
+    let caption: Font
+    let mapLabel: Font
+    let mono: Font
+    let mapLabelNS: NSFont
+
+    init(_ scheme: ColorScheme) {
+        background = scheme == .dark ? Color(.sRGB, red: 0, green: 0, blue: 0, opacity: 1) : Color(.sRGB, red: 0.961, green: 0.953, blue: 0.937, opacity: 1)
+        mapSurface = scheme == .dark ? Color(.sRGB, red: 0.26, green: 0.26, blue: 0.26, opacity: 1) : Color(.sRGB, red: 0.88, green: 0.87, blue: 0.84, opacity: 1)
+        textPrimary = scheme == .dark ? Color(.sRGB, red: 0.91, green: 0.91, blue: 0.91, opacity: 1) : Color(.sRGB, red: 0.1, green: 0.1, blue: 0.1, opacity: 1)
+        textSecondary = scheme == .dark ? Color(.sRGB, red: 0.67, green: 0.67, blue: 0.67, opacity: 1) : Color(.sRGB, red: 0.37, green: 0.37, blue: 0.37, opacity: 1)
+        textDisabled = scheme == .dark ? Color(.sRGB, red: 0.42, green: 0.42, blue: 0.42, opacity: 1) : Color(.sRGB, red: 0.52, green: 0.52, blue: 0.52, opacity: 1)
+        border = scheme == .dark ? Color(.sRGB, red: 0.24, green: 0.24, blue: 0.24, opacity: 1) : Color(.sRGB, red: 0.78, green: 0.78, blue: 0.78, opacity: 1)
+        hover = scheme == .dark ? Color(.sRGB, red: 0.12, green: 0.12, blue: 0.12, opacity: 1) : Color(.sRGB, red: 0.91, green: 0.90, blue: 0.88, opacity: 1)
+        pressed = scheme == .dark ? Color(.sRGB, red: 0.16, green: 0.16, blue: 0.16, opacity: 1) : Color(.sRGB, red: 0.86, green: 0.85, blue: 0.83, opacity: 1)
+        focus = textPrimary
+        actionBackground = scheme == .dark ? Color(.sRGB, red: 0.22, green: 0.22, blue: 0.22, opacity: 1) : Color(.sRGB, red: 0.88, green: 0.87, blue: 0.84, opacity: 1)
+        actionText = scheme == .dark ? Color(.sRGB, red: 0.92, green: 0.92, blue: 0.92, opacity: 1) : Color(.sRGB, red: 0.12, green: 0.12, blue: 0.12, opacity: 1)
+        connected = Color(.sRGB, red: 0.29, green: 0.62, blue: 0.36, opacity: 1)
+        disconnected = Color(.sRGB, red: 0.84, green: 0.10, blue: 0.13, opacity: 1)
+        clear = .clear
+        display = .custom("Doto", size: 36).weight(.medium)
+        body = .custom("Space Grotesk", size: 14)
+        bodySmall = .custom("Space Grotesk", size: 11)
+        caption = .custom("Space Grotesk", size: 11)
+        mapLabelNS = NSFont(name: "Space Grotesk", size: 11) ?? .systemFont(ofSize: 11)
+        mapLabel = Font(mapLabelNS)
+        mono = .custom("Space Mono", size: 11)
+    }
 }
 
 enum FontRegistrar {
@@ -27,7 +80,7 @@ func renderPreviews(to directory: String) throws {
     try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
     let monitor = ConnectionMonitor(previewOnly: true)
     for (name, scheme) in [("light", ColorScheme.light), ("dark", ColorScheme.dark)] {
-        let renderer = ImageRenderer(content: NothingPopover(monitor: monitor, previewScheme: scheme, previewMode: true).preview)
+        let renderer = ImageRenderer(content: NothingPopover(monitor: monitor, previewScheme: scheme))
         renderer.proposedSize = ProposedViewSize(width: 320, height: nil)
         renderer.scale = 2
         guard let image = renderer.cgImage,
@@ -51,7 +104,8 @@ func renderTrayIconSheet(to path: String) throws {
 }
 
 private struct TrayIconSheet: View {
-    private let labels = ["CONNECTED", "STANDBY", "DISCONNECTED", "OFF", "UNKNOWN"]
+    private let labels = ["Connected", "Standby", "Disconnected", "Off", "Unknown"]
+    private let tokens = PopoverTokens(.dark)
 
     var body: some View {
         HStack(spacing: 24) {
@@ -59,188 +113,343 @@ private struct TrayIconSheet: View {
                 let spec = trayIconSpec(for: state)
                 VStack(spacing: 8) {
                     Image(systemName: spec.symbol)
-                        .font(.system(size: 30, weight: .medium))
-                        .foregroundStyle(.white)
+                        .font(tokens.body.weight(.medium))
+                        .foregroundStyle(tokens.textPrimary)
                         .opacity(spec.opacity)
                         .overlay(alignment: .topTrailing) {
                             if spec.showsRedDot {
-                                Circle().fill(Color(red: 0.843, green: 0.098, blue: 0.129)).frame(width: 8, height: 8)
+                                Circle().fill(tokens.disconnected).frame(width: 8, height: 8)
                             }
                         }
                     Text(labels[index])
-                        .font(.system(size: 10, weight: .medium, design: .monospaced))
-                        .foregroundStyle(Color(white: 0.72))
+                        .font(tokens.caption)
+                        .foregroundStyle(tokens.textSecondary)
                 }
                 .frame(width: 112)
             }
         }
         .frame(width: 700, height: 112)
-        .background(Color(white: 0.08))
+        .background(tokens.background)
     }
 }
 
 struct NothingPopover: View {
     @ObservedObject var monitor: ConnectionMonitor
     @Environment(\.colorScheme) private var scheme
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     var previewScheme: ColorScheme? = nil
-    var previewMode = false
+    @State private var settingsExpanded = false
+    @State private var hoveredColorPicker: ZoneColorRole?
+    @FocusState private var focusedControl: PopoverControl?
 
-    private var effectiveScheme: ColorScheme { previewScheme ?? scheme }
-    private var background: Color { effectiveScheme == .dark ? .black : Color(red: 0.961, green: 0.953, blue: 0.937) }
-    private var surface: Color { effectiveScheme == .dark ? Color(white: 0.067) : .white }
-    private var border: Color { effectiveScheme == .dark ? Color(white: 0.2) : Color(white: 0.8) }
-    private var primary: Color { effectiveScheme == .dark ? Color(white: 0.91) : Color(white: 0.1) }
-    private var secondary: Color { effectiveScheme == .dark ? Color(white: 0.6) : Color(white: 0.4) }
+    private enum PopoverControl: Hashable {
+        case reconnect, settings, autoReconnect, crossingZone, connectedColor, disconnectedColor, resetColors, quit
+    }
 
-    private var hero: String {
+    private var tokens: PopoverTokens { PopoverTokens(previewScheme ?? scheme) }
+    private var stateWord: String {
         switch monitor.trayState {
-        case .connected: "CONNECTED"
-        case .standby: "STANDBY"
-        case .disconnected: "DISCONNECTED"
-        case .off: "OFF"
-        case .unknown: "UNKNOWN"
+        case .connected, .standby: "Connected"
+        case .disconnected: "Disconnected"
+        case .off: "Off"
+        case .unknown: "Unknown"
         }
     }
 
-    private var heroColor: Color {
+    private var stateColor: Color {
         switch monitor.trayState {
-        case .connected: Color(red: 0.29, green: 0.62, blue: 0.36)
-        case .disconnected: Color(red: 0.843, green: 0.098, blue: 0.129)
-        default: primary
+        case .connected, .standby: tokens.connected
+        case .disconnected: tokens.disconnected
+        case .off: tokens.textDisabled
+        case .unknown: tokens.textSecondary
         }
     }
 
-    private var content: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 8) {
-                Text("CROSSOVER").nothingLabel(secondary)
-                Text(hero)
-                    .font(.custom("Doto", size: 38).weight(.bold))
-                    .foregroundStyle(heroColor)
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.72)
-                ForEach(Array(monitor.positionLines.enumerated()), id: \.offset) { _, line in
-                    Text(line)
-                        .font(.custom("Space Grotesk", size: 14))
-                        .foregroundStyle(primary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                }
-                Text("LAST CHANGE  \(formattedLastChange(monitor.changedAt))")
-                    .nothingLabel(secondary)
+    private var stateDetail: Text {
+        if monitor.configuredDevicesEmpty { return Text("Turn on Universal Control in System Settings") }
+        return switch monitor.state {
+        case .connected:
+            Text(monitor.sessionSubstate == .inUse ? "In use since " : "Standby since ") +
+                Text(formattedLastChange(monitor.changedAt ?? Date())).font(tokens.mono)
+        case .disconnected:
+            if let changedAt = monitor.changedAt {
+                Text("Since ") + Text(formattedLastChange(changedAt)).font(tokens.mono)
+            } else {
+                Text("Not connected")
             }
-
-            VStack(spacing: 12) {
-                Button { monitor.reconnectNow() } label: {
-                    HStack {
-                        Text("RECONNECT").nothingLabel(primary).lineLimit(1).layoutPriority(1)
-                        Spacer()
-                        Text(monitor.reconnectStatus ?? "[READY]").nothingLabel(secondary)
-                            .lineLimit(1).fixedSize(horizontal: true, vertical: false)
-                    }
-                    .padding(.horizontal, 14)
-                    .frame(height: 36)
-                    .overlay(Capsule().stroke(border, lineWidth: 1))
-                }
-                .buttonStyle(.plain)
-
-                NothingToggle(label: "AUTO-RECONNECT", isOn: $monitor.autoReconnectEnabled,
-                              primary: primary, secondary: secondary, border: border)
-                NothingToggle(label: "SHOW CROSSING ZONE", isOn: $monitor.showCrossingZone,
-                              primary: primary, secondary: secondary, border: border)
-            }
-
-            VStack(alignment: .leading, spacing: 8) {
-                Text("CROSSING ZONE COLORS").nothingLabel(secondary)
-                ForEach(ZoneColorRole.allCases, id: \.self) { role in
-                    HStack(spacing: 8) {
-                        Text(role.rawValue).nothingLabel(primary).lineLimit(1)
-                            .frame(width: 112, alignment: .leading)
-                        Spacer(minLength: 0)
-                        if previewMode {
-                            RoundedRectangle(cornerRadius: 4).fill(colorBinding(role).wrappedValue)
-                                .frame(width: 28, height: 20)
-                        } else {
-                            ColorPicker("", selection: colorBinding(role), supportsOpacity: true)
-                                .labelsHidden()
-                                .frame(width: 28, height: 20)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
-                    }
-                    .frame(height: 28)
-                }
-                HStack {
-                    Spacer()
-                    Button("[ RESET DEFAULTS ]") { monitor.resetZoneColors() }
-                        .buttonStyle(.plain)
-                        .nothingLabel(secondary)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.vertical, 14)
-            .background { surface.padding(.horizontal, -14) }
-            .overlay { Rectangle().stroke(border, lineWidth: 1).padding(.horizontal, -14) }
-
-            HStack {
-                Text("SYSTEM APPEARANCE").nothingLabel(secondary).lineLimit(1).layoutPriority(1)
-                Spacer()
-                Button("[ QUIT ]") { NSApplication.shared.terminate(nil) }
-                    .buttonStyle(.plain)
-                    .nothingLabel(primary)
-            }
+        case .unknown: Text("Waiting for Universal Control")
         }
-        .padding(20)
     }
 
-    var preview: some View { content.frame(width: 320).background(background).focusEffectDisabled() }
+    private var reconnectStyle: PopoverButtonKind {
+        monitor.state == .disconnected || monitor.reconnectStatus == "[FAILED]" ? .primary : .row
+    }
 
     var body: some View {
-        content
+        VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(stateWord)
+                    .font(tokens.display)
+                    .foregroundStyle(stateColor)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.75)
+                stateDetail
+                    .font(tokens.bodySmall)
+                    .foregroundStyle(tokens.textPrimary)
+                    .lineLimit(1)
+            }
+
+            LayoutMap(layout: monitor.displayLayout, segments: monitor.crossingSegments,
+                      zoneColor: stateColor, tokens: tokens)
+
+            VStack(alignment: .leading, spacing: 4) {
+                ForEach(Array(monitor.positionLines.enumerated()), id: \.offset) { _, line in
+                    positionText(line)
+                        .font(tokens.bodySmall)
+                        .foregroundStyle(tokens.textPrimary)
+                        .lineLimit(1)
+                        .truncationMode(.tail)
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Button { monitor.reconnectNow() } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "arrow.clockwise")
+                        Text("Reconnect")
+                        Spacer(minLength: 0)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(PopoverButtonStyle(tokens: tokens, kind: reconnectStyle, pill: true))
+                .popoverFocusRing(focusedControl == .reconnect, tokens: tokens, radius: 21)
+                .focused($focusedControl, equals: .reconnect)
+                .disabled(monitor.reconnectStatus == "[RECONNECTING...]")
+
+                if let status = reconnectMessage {
+                    Text(status)
+                        .font(tokens.bodySmall)
+                        .foregroundStyle(monitor.reconnectStatus == "[FAILED]" ? tokens.disconnected : tokens.textSecondary)
+                        .padding(.leading, 12)
+                }
+            }
+            .padding(.top, 16)
+
+            VStack(alignment: .leading, spacing: 4) {
+                Button {
+                    withAnimation(reduceMotion ? nil : .easeOut(duration: 0.18)) { settingsExpanded.toggle() }
+                } label: {
+                    HStack {
+                        Text("Settings")
+                        Spacer()
+                        Image(systemName: settingsExpanded ? "chevron.up" : "chevron.down")
+                            .font(tokens.caption)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .buttonStyle(PopoverButtonStyle(tokens: tokens, kind: .row))
+                .popoverFocusRing(focusedControl == .settings, tokens: tokens, radius: 8)
+                .focused($focusedControl, equals: .settings)
+                .accessibilityValue(settingsExpanded ? "Expanded" : "Collapsed")
+
+                if settingsExpanded {
+                    VStack(alignment: .leading, spacing: 4) {
+                        PopoverToggle(label: "Reconnect automatically", isOn: $monitor.autoReconnectEnabled,
+                                      tokens: tokens, focused: focusedControl == .autoReconnect)
+                            .focused($focusedControl, equals: .autoReconnect)
+                        PopoverToggle(label: "Show crossing zone", isOn: $monitor.showCrossingZone,
+                                      tokens: tokens, focused: focusedControl == .crossingZone)
+                            .focused($focusedControl, equals: .crossingZone)
+
+                        Text("Crossing zone colors")
+                            .font(tokens.bodySmall)
+                            .foregroundStyle(tokens.textSecondary)
+                            .padding(.top, 4)
+                        ForEach(ZoneColorRole.allCases, id: \.self) { role in
+                            HStack {
+                                Text(role.label)
+                                    .font(tokens.bodySmall)
+                                    .foregroundStyle(tokens.textPrimary)
+                                Spacer()
+                                ColorPicker(role.label, selection: colorBinding(role), supportsOpacity: true)
+                                    .labelsHidden()
+                                    .frame(width: 34, height: 30)
+                                    .background(hoveredColorPicker == role ? tokens.hover : tokens.clear,
+                                                in: RoundedRectangle(cornerRadius: 8))
+                                    .popoverFocusRing(focusedControl == colorControl(role), tokens: tokens, radius: 8)
+                                    .focusEffectDisabled()
+                                    .focused($focusedControl, equals: colorControl(role))
+                                    .accessibilityLabel(role.label + " zone color")
+                                    .onHover { hoveredColorPicker = $0 ? role : nil }
+                            }
+                            .frame(minHeight: 32)
+                        }
+
+                        HStack {
+                            Spacer()
+                            Button("Reset colors") { monitor.resetZoneColors() }
+                                .buttonStyle(PopoverButtonStyle(tokens: tokens, kind: .text))
+                                .popoverFocusRing(focusedControl == .resetColors, tokens: tokens, radius: 8)
+                                .focused($focusedControl, equals: .resetColors)
+                        }
+                    }
+                    .padding(.leading, 8)
+                    .transition(reduceMotion ? .identity : .opacity)
+                }
+            }
+
+            Rectangle()
+                .fill(tokens.border)
+                .frame(height: 1)
+
+            HStack {
+                (Text("Crossover ").font(tokens.caption) + Text(appVersion).font(tokens.mono))
+                    .foregroundStyle(tokens.textDisabled)
+                Spacer()
+                Button("Quit") { NSApplication.shared.terminate(nil) }
+                    .buttonStyle(PopoverButtonStyle(tokens: tokens, kind: .text))
+                    .popoverFocusRing(focusedControl == .quit, tokens: tokens, radius: 8)
+                    .focused($focusedControl, equals: .quit)
+            }
+        }
+        .padding(16)
         .frame(width: 320)
-        .background(background)
+        .background(tokens.background)
         .focusEffectDisabled()
+        .onAppear {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { focusedControl = nil }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { focusedControl = nil }
+        }
+    }
+
+    private var appVersion: String {
+        Bundle.main.infoDictionary?["CFBundleShortVersionString"] as? String ?? "1.0"
+    }
+
+    private var reconnectMessage: String? {
+        switch monitor.reconnectStatus {
+        case "[RECONNECTING...]": "Reconnecting…"
+        case "[FAILED]": "Couldn’t reconnect"
+        default: nil
+        }
+    }
+
+    private func positionText(_ line: String) -> Text {
+        guard let comma = line.range(of: ",", options: .backwards) else { return Text(line) }
+        return Text(String(line[..<comma.upperBound])) + Text(String(line[comma.upperBound...])).font(tokens.mono)
+    }
+
+    private func colorControl(_ role: ZoneColorRole) -> PopoverControl {
+        switch role {
+        case .connected: .connectedColor
+        case .disconnected: .disconnectedColor
+        }
     }
 
     private func colorBinding(_ role: ZoneColorRole) -> Binding<Color> {
         Binding {
             switch role {
             case .connected: Color(monitor.zoneColors.connected.nsColor)
-            case .standby: Color(monitor.zoneColors.standby.nsColor)
             case .disconnected: Color(monitor.zoneColors.disconnected.nsColor)
             }
         } set: { monitor.setZoneColor(role, color: NSColor($0)) }
     }
 }
 
-private struct NothingToggle: View {
+private struct PopoverToggle: View {
     let label: String
     @Binding var isOn: Bool
-    let primary: Color
-    let secondary: Color
-    let border: Color
+    let tokens: PopoverTokens
+    let focused: Bool
 
     var body: some View {
         Button { isOn.toggle() } label: {
             HStack {
-                Text(label).nothingLabel(isOn ? primary : secondary).lineLimit(1).layoutPriority(1)
-                Spacer()
-                Text(isOn ? "[ ON ]" : "[ OFF ]").nothingLabel(isOn ? primary : secondary)
+                Text(label)
+                    .font(tokens.bodySmall)
+                    .foregroundStyle(tokens.textPrimary)
                     .lineLimit(1)
-                    .fixedSize(horizontal: true, vertical: false)
-                    .frame(minWidth: 56)
-                    .padding(.vertical, 5)
-                    .overlay(Rectangle().stroke(border, lineWidth: 1))
+                    .layoutPriority(1)
+                Spacer()
+                RoundedRectangle(cornerRadius: 10)
+                    .fill(isOn ? tokens.actionBackground : tokens.border)
+                    .frame(width: 36, height: 20)
+                    .overlay(alignment: isOn ? .trailing : .leading) {
+                        Circle()
+                            .fill(isOn ? tokens.actionText : tokens.mapSurface)
+                            .frame(width: 14, height: 14)
+                            .padding(3)
+                    }
             }
+            .frame(maxWidth: .infinity, minHeight: 38, alignment: .leading)
         }
-        .buttonStyle(.plain)
+        .buttonStyle(PopoverButtonStyle(tokens: tokens, kind: .row))
+        .popoverFocusRing(focused, tokens: tokens, radius: 8)
+        .focusEffectDisabled()
+        .accessibilityLabel(label)
         .accessibilityValue(isOn ? "On" : "Off")
+        .accessibilityAddTraits(.isButton)
+    }
+}
+
+private enum PopoverButtonKind: Equatable {
+    case primary, row, text
+}
+
+private struct PopoverButtonStyle: ButtonStyle {
+    let tokens: PopoverTokens
+    let kind: PopoverButtonKind
+    var pill = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        PopoverButtonVisual(configuration: configuration, tokens: tokens, kind: kind, pill: pill)
+    }
+}
+
+private struct PopoverButtonVisual: View {
+    let configuration: ButtonStyle.Configuration
+    let tokens: PopoverTokens
+    let kind: PopoverButtonKind
+    let pill: Bool
+    @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var hovered = false
+
+    private var radius: CGFloat { kind == .primary || pill ? 21 : 8 }
+    private var foreground: Color {
+        guard isEnabled else { return tokens.textDisabled }
+        return tokens.textPrimary
+    }
+    private var fill: Color {
+        guard isEnabled else { return tokens.clear }
+        if configuration.isPressed { return tokens.pressed }
+        if hovered { return tokens.hover }
+        return kind == .primary ? tokens.actionBackground : tokens.clear
+    }
+
+    var body: some View {
+        configuration.label
+            .font(kind == .primary ? tokens.body.weight(.medium) : tokens.bodySmall)
+            .foregroundStyle(foreground)
+            .padding(.horizontal, pill ? 22 : kind == .primary ? 14 : kind == .row ? 0 : 8)
+            .frame(minHeight: kind == .primary ? 42 : 38)
+            .background(fill, in: RoundedRectangle(cornerRadius: radius))
+            .overlay(RoundedRectangle(cornerRadius: radius)
+                .stroke(kind == .primary || pill ? tokens.border : tokens.clear, lineWidth: 1))
+            .scaleEffect(configuration.isPressed && !reduceMotion ? 0.985 : 1)
+            .opacity(isEnabled ? 1 : 0.55)
+            .contentShape(RoundedRectangle(cornerRadius: radius))
+            .onHover { hovered = $0 }
     }
 }
 
 private extension View {
-    func nothingLabel(_ color: Color) -> some View {
-        font(.custom("Space Mono", size: 11).weight(.medium))
-            .foregroundStyle(color)
-            .tracking(0.5)
+    func popoverFocusRing(_ focused: Bool, tokens: PopoverTokens, radius: CGFloat) -> some View {
+        overlay(RoundedRectangle(cornerRadius: radius)
+            .stroke(focused ? tokens.focus : tokens.clear, lineWidth: 1)
+            .padding(-2))
+            .focusEffectDisabled()
     }
 }

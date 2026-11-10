@@ -78,6 +78,15 @@ enum ScreenEdge: String, Equatable, Hashable {
         }
     }
 
+    var readablePosition: String {
+        switch self {
+        case .top: "Above"
+        case .bottom: "Below"
+        case .left: "Left of"
+        case .right: "Right of"
+        }
+    }
+
     var iPadDirection: String {
         switch self {
         case .top: "above"
@@ -283,6 +292,28 @@ func parserSelfCheck() {
     guard case .layout(let layout) = layoutEvent else { selfCheckFailure("combined display layout event") }
     let crossing = segments(layout)
     check("crossing segment count", crossing.count == 2)
+    let mapSize = CGSize(width: 288, height: 120)
+    let mapGeometry = checked("normalized layout map geometry",
+                              layoutMapGeometry(layout: layout, segments: crossing, size: mapSize))
+    check("layout map display count", mapGeometry.displays.count == 4)
+    check("layout map crossing count", mapGeometry.crossings.count == 2)
+    let firstCrossing = mapGeometry.crossings[0]
+    let secondCrossing = mapGeometry.crossings[1]
+    let crossingGap = [
+        hypot((firstCrossing.start.x - secondCrossing.start.x) * mapSize.width, (firstCrossing.start.y - secondCrossing.start.y) * mapSize.height),
+        hypot((firstCrossing.start.x - secondCrossing.end.x) * mapSize.width, (firstCrossing.start.y - secondCrossing.end.y) * mapSize.height),
+        hypot((firstCrossing.end.x - secondCrossing.start.x) * mapSize.width, (firstCrossing.end.y - secondCrossing.start.y) * mapSize.height),
+        hypot((firstCrossing.end.x - secondCrossing.end.x) * mapSize.width, (firstCrossing.end.y - secondCrossing.end.y) * mapSize.height)
+    ].min() ?? 0
+    check("layout map crossings have a visible seam gap", crossingGap >= 4.9)
+    let mapIPad = checked("layout map iPad rectangle", mapGeometry.displays.first(where: \.isIPad))
+    let crossingDisplays = mapGeometry.displays.filter { display in
+        crossing.contains(where: { $0.displayUUID == display.displayUUID })
+    }
+    check("layout map iPad below crossing displays", crossingDisplays.allSatisfy { mapIPad.frame.midY > $0.frame.midY })
+    check("layout map rectangles normalized", mapGeometry.displays.allSatisfy {
+        $0.frame.minX >= 0 && $0.frame.minY >= 0 && $0.frame.maxX <= 1 && $0.frame.maxY <= 1
+    })
     let u2414h = checked("U2414H crossing segment", crossing.first { $0.displayUUID == "83C79C5D-BB83-4577-8946-1870855150FB" })
     check("U2414H crossing start", u2414h.edge == .bottom && abs(u2414h.startFraction) < 0.001)
     check("U2414H crossing end", abs(u2414h.endFraction - (987.0 / 1920.0)) < 0.001)
@@ -320,6 +351,7 @@ final class ConnectionMonitor: ObservableObject {
     @Published private(set) var sessionSubstate: SessionSubstate?
     @Published private(set) var configuredDevicesEmpty = false
     @Published private(set) var reconnectStatus: String?
+    @Published private(set) var displayLayout: [DisplayLayoutEntry] = []
     @Published var zoneColors = ZoneColors.load() {
         didSet {
             zoneColors.save()
@@ -500,6 +532,7 @@ final class ConnectionMonitor: ObservableObject {
                     UserDefaults.standard.set(line, forKey: "lastConfigLine")
                 }
             case .layout(let layout):
+                displayLayout = layout
                 crossingSegments = segments(layout)
                 UserDefaults.standard.set(line, forKey: "lastCombinedLayoutLine")
                 if !replay { updateOverlay() }
@@ -553,15 +586,22 @@ final class ConnectionMonitor: ObservableObject {
     }
 
     private func updateOverlay() {
-        overlay.update(segments: crossingSegments, state: state, session: sessionSubstate,
+        overlay.update(segments: crossingSegments, state: state,
                        colors: zoneColors, enabled: showCrossingZone, universalControlOff: configuredDevicesEmpty)
     }
 
     var positionLines: [String] {
         if !crossingSegments.isEmpty {
-            return crossingSegments.sorted { $0.startFraction < $1.startFraction }.map(\.description)
+            return crossingSegments.sorted { $0.startFraction < $1.startFraction }.map { segment in
+                let display = screen(for: segment.displayUUID)?.localizedName ?? "Mac display"
+                let start = Int((segment.startFraction * 100).rounded())
+                let end = Int((segment.endFraction * 100).rounded())
+                return "\(segment.edge.readablePosition) \(display), \(start)–\(end)%"
+            }
         }
-        return iPadPosition.map { [$0.description] } ?? ["UNKNOWN"]
+        guard let position = iPadPosition else { return [] }
+        let display = screen(for: position.displayUUID)?.localizedName ?? "Mac display"
+        return ["\(position.edge.readablePosition) \(display)"]
     }
 
     var trayState: TrayState {
@@ -586,7 +626,6 @@ final class ConnectionMonitor: ObservableObject {
         let value = RGBAColor(color)
         switch role {
         case .connected: zoneColors.connected = value
-        case .standby: zoneColors.standby = value
         case .disconnected: zoneColors.disconnected = value
         }
     }
@@ -702,14 +741,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             popover.performClose(nil)
         } else {
             popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.initialFirstResponder = nil
+            if let window = popover.contentViewController?.view.window,
+               let contentView = popover.contentViewController?.view {
+                window.initialFirstResponder = contentView
+                window.makeFirstResponder(contentView)
+            }
         }
     }
 
     private func updateStatusIcon() {
         guard let button = statusItem.button else { return }
+        let isReconnecting = monitor.reconnectStatus == "[RECONNECTING...]"
         let pulse = Int(Date().timeIntervalSinceReferenceDate) % 2 == 0
-        let spec = monitor.reconnectStatus == "[RECONNECTING...]" && pulse
+        let reduceMotion = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion
+        let spec = isReconnecting && (reduceMotion || pulse)
             ? TrayIconSpec(symbol: "ellipsis.circle", opacity: 1, showsRedDot: false)
             : trayIconSpec(for: monitor.trayState)
         let image = NSImage(systemSymbolName: spec.symbol, accessibilityDescription: monitor.trayAccessibilityLabel)?

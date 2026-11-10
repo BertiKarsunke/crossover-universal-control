@@ -27,13 +27,14 @@ struct RGBAColor: Codable, Equatable {
 
 struct ZoneColors: Codable, Equatable {
     var connected: RGBAColor
+    // Keep the saved legacy value so existing preferences still decode and round-trip.
     var standby: RGBAColor
     var disconnected: RGBAColor
 
     static let defaults = ZoneColors(
-        connected: RGBAColor(red: 0.204, green: 0.780, blue: 0.349, alpha: 0.5),
+        connected: RGBAColor(red: 0.29, green: 0.62, blue: 0.36, alpha: 0.5),
         standby: RGBAColor(red: 0, green: 0.478, blue: 1, alpha: 0.4),
-        disconnected: RGBAColor(red: 1, green: 0.231, blue: 0.188, alpha: 0.3)
+        disconnected: RGBAColor(red: 0.843, green: 0.098, blue: 0.129, alpha: 0.3)
     )
 
     func encoded() -> Data? { try? JSONEncoder().encode(self) }
@@ -146,14 +147,14 @@ func screen(for displayUUID: String) -> NSScreen? {
 extension IPadPosition {
     var description: String {
         let name = screen(for: displayUUID)?.localizedName ?? "Mac screen"
-        return "\(edge.positionLabel) · \(name)"
+        return "\(edge.readablePosition) \(name)"
     }
 }
 
 extension CrossingSegment {
     var description: String {
         let name = screen(for: displayUUID)?.localizedName ?? "Mac screen"
-        return "\(edge.positionLabel) · \(name) · \(Int((startFraction * 100).rounded()))-\(Int((endFraction * 100).rounded()))%"
+        return "\(edge.readablePosition) \(name), \(Int((startFraction * 100).rounded()))–\(Int((endFraction * 100).rounded()))%"
     }
 }
 
@@ -161,16 +162,14 @@ extension CrossingSegment {
 final class OverlayController {
     private var windows: [CrossingSegmentKey: NSWindow] = [:]
 
-    func update(segments: [CrossingSegment], state: ConnectionState, session: SessionSubstate?,
+    func update(segments: [CrossingSegment], state: ConnectionState,
                 colors: ZoneColors, enabled: Bool, universalControlOff: Bool) {
         guard enabled, !universalControlOff, state != .unknown else {
             windows.values.forEach { $0.close() }
             windows.removeAll()
             return
         }
-        let color = state == .disconnected
-            ? colors.disconnected.nsColor
-            : session == .standby ? colors.standby.nsColor : colors.connected.nsColor
+        let color = state == .disconnected ? colors.disconnected.nsColor : colors.connected.nsColor
         let activeKeys = Set(segments.map(\.key))
         for key in Array(windows.keys) where !activeKeys.contains(key) {
             windows.removeValue(forKey: key)?.close()

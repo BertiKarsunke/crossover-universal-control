@@ -1,4 +1,4 @@
-# Crossover
+# Crossover — Universal Control helper
 
 Crossover는 Universal Control(Mac과 iPad 사이의 포인터 공유)의 연결 상태와 포인터가 화면을 넘나드는 위치를 표시하고, 연결이 끊기면 자동으로 다시 연결하는 macOS 메뉴 막대 앱입니다.
 
@@ -42,7 +42,7 @@ Crossover는 macOS 통합 로그에서 `com.apple.universalcontrol` 하위 시�
 
 ## 설치 및 빌드
 
-최신 DMG 또는 PKG는 [GitHub Releases](https://github.com/BertiKarsunke/crossover/releases)에서 받을 수 있습니다. 직접 빌드하려면 macOS와 Xcode Command Line Tools가 필요합니다.
+최신 DMG 또는 PKG는 [GitHub Releases](https://github.com/BertiKarsunke/crossover-universal-control/releases)에서 받을 수 있습니다. 직접 빌드하려면 macOS와 Xcode Command Line Tools가 필요합니다.
 
 ```sh
 ./build-app.sh
