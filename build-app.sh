@@ -10,20 +10,25 @@ if [[ -z "${DEVELOPER_DIR:-}" && "$(xcode-select -p)" == */CommandLineTools ]]; 
   done
 fi
 swift build -c release
-app=".build/UniversalControlHelper.app"
-mkdir -p "$app/Contents/MacOS"
-cp .build/release/UniversalControlHelper "$app/Contents/MacOS/UniversalControlHelper"
+app=".build/Crossover.app"
+rm -rf "$app"
+mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+cp .build/release/Crossover "$app/Contents/MacOS/Crossover"
+cp -R .build/release/Crossover_Crossover.bundle "$app/Contents/Resources/"
+cp -R Sources/Crossover/Resources/Fonts "$app/Contents/Resources/Fonts"
 cat > "$app/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-<key>CFBundleExecutable</key><string>UniversalControlHelper</string>
-<key>CFBundleIdentifier</key><string>com.local.universalcontrolhelper</string>
-<key>CFBundleName</key><string>Universal Control Helper</string>
+<key>CFBundleExecutable</key><string>Crossover</string>
+<key>CFBundleIdentifier</key><string>com.local.crossover</string>
+<key>CFBundleName</key><string>Crossover</string>
+<key>CFBundleDisplayName</key><string>Crossover</string>
 <key>CFBundleShortVersionString</key><string>1.0.0</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>LSUIElement</key><true/>
 <key>NSHighResolutionCapable</key><true/>
+<key>ATSApplicationFontsPath</key><string>Fonts</string>
 </dict></plist>
 PLIST
 echo "Built $app"

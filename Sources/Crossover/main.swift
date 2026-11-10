@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 import UserNotifications
 
@@ -10,13 +11,72 @@ enum SessionSubstate: String, Equatable {
     case inUse = "in use", standby
 }
 
+let legacySettingsDomain = "com.local.universalcontrolhelper"
+let settingsMigratedKey = "legacySettingsMigrated"
+let settingsKeysToMigrate = [
+    "zoneColors", "autoReconnectEnabled", "showCrossingZone", "lastCombinedLayoutLine",
+    "lastConfigLine", "lastConnectionState", "lastConfiguredDevicesEmpty"
+]
+
+func migratedSettings(from oldDomain: [String: Any]) -> [String: Any] {
+    Dictionary(uniqueKeysWithValues: settingsKeysToMigrate.compactMap { key in oldDomain[key].map { (key, $0) } })
+}
+
+func migrateLegacySettings(newDefaults: UserDefaults, newDomain: String, oldDefaults: UserDefaults) {
+    var domain = newDefaults.persistentDomain(forName: newDomain) ?? [:]
+    guard domain[settingsMigratedKey] as? Bool != true else { return }
+    if domain.isEmpty {
+        domain = migratedSettings(from: oldDefaults.persistentDomain(forName: legacySettingsDomain) ?? [:])
+    }
+    domain[settingsMigratedKey] = true
+    newDefaults.setPersistentDomain(domain, forName: newDomain)
+}
+
+func formattedLastChange(_ date: Date?, now: Date = Date()) -> String {
+    guard let date else { return "NEVER" }
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = Calendar.current.timeZone
+    formatter.dateFormat = Calendar.current.isDate(date, inSameDayAs: now) ? "HH:mm" : "MM-dd HH:mm"
+    return formatter.string(from: date)
+}
+
+enum TrayState: CaseIterable {
+    case connected, standby, disconnected, off, unknown
+}
+
+struct TrayIconSpec: Equatable, Hashable {
+    let symbol: String
+    let opacity: Double
+    let showsRedDot: Bool
+}
+
+func trayIconSpec(for state: TrayState) -> TrayIconSpec {
+    switch state {
+    case .connected: TrayIconSpec(symbol: "circle.fill", opacity: 1, showsRedDot: false)
+    case .standby: TrayIconSpec(symbol: "circle", opacity: 1, showsRedDot: false)
+    case .disconnected: TrayIconSpec(symbol: "circle", opacity: 1, showsRedDot: true)
+    case .off: TrayIconSpec(symbol: "circle.slash", opacity: 0.4, showsRedDot: false)
+    case .unknown: TrayIconSpec(symbol: "ellipsis.circle", opacity: 1, showsRedDot: false)
+    }
+}
+
 struct PeerConnection: Equatable {
     let id: String
     let status: String
 }
 
-enum ScreenEdge: String, Equatable {
+enum ScreenEdge: String, Equatable, Hashable {
     case top, bottom, left, right
+
+    var positionLabel: String {
+        switch self {
+        case .top: "ABOVE"
+        case .bottom: "BELOW"
+        case .left: "LEFT OF"
+        case .right: "RIGHT OF"
+        }
+    }
 
     var iPadDirection: String {
         switch self {
@@ -219,6 +279,7 @@ func parserSelfCheck() {
     check("config reversed direction", parseEvent(reversedConfig) == .config(expectedPosition))
     check("config leaves state", stateAfter(configEvent, current: .connected) == .connected)
     let layoutEvent = checked("parse combined display layout", parseEvent(layoutLine))
+    check("truncated display layout ignored", parseDisplayLayout(String(layoutLine.dropLast(20)) + "<…>") == nil)
     guard case .layout(let layout) = layoutEvent else { selfCheckFailure("combined display layout event") }
     let crossing = segments(layout)
     check("crossing segment count", crossing.count == 2)
@@ -228,6 +289,11 @@ func parserSelfCheck() {
     let p2425h = checked("P2425H crossing segment", crossing.first { $0.displayUUID == "833B132E-542B-4367-8A60-67C7D42B8003" })
     check("P2425H crossing start", p2425h.edge == .bottom && abs(p2425h.startFraction - (1697.0 / 1920.0)) < 0.001)
     check("P2425H crossing end", abs(p2425h.endFraction - 1.0) < 0.001)
+    let u2414hFrame = overlayFrame(u2414h, screenFrame: CGRect(x: -1543, y: 0, width: 1920, height: 1080))
+    let p2425hFrame = overlayFrame(p2425h, screenFrame: CGRect(x: -3463, y: 0, width: 1920, height: 1080))
+    check("distinct crossing frames", u2414hFrame != p2425hFrame)
+    check("U2414H overlay frame", abs(u2414hFrame.minX + 1543) < 0.001 && abs(u2414hFrame.width - 987) < 0.001 && u2414hFrame.height == 6)
+    check("P2425H overlay frame", abs(p2425hFrame.minX + 1766) < 0.001 && abs(p2425hFrame.width - 223) < 0.001 && p2425hFrame.height == 6)
     check("buffer drain ordering", replayThenBuffered(["history-1", "history-2"], ["live-1", "live-2"]) == ["history-1", "history-2", "live-1", "live-2"])
     let timestamp = checked("parse log timestamp", parseLogTimestamp(connected))
     check("log timestamp value", logTimestampFormatter.string(from: timestamp) == "2026-11-10 13:15:32.584")
@@ -235,6 +301,15 @@ func parserSelfCheck() {
     check("unrelated log ignored", parseEvent("unrelated log line") == nil)
     check("reconnect grace", reconnectDecision(autoEnabled: true, attempts: 0, secondsSinceReconnect: 5, timerExpired: false) == .ignoreDisconnect)
     check("reconnect attempt limit", reconnectDecision(autoEnabled: true, attempts: 3, secondsSinceReconnect: nil, timerExpired: true) == .failed)
+    let colorsData = checked("zone colors encode", ZoneColors.defaults.encoded())
+    check("zone colors round trip", ZoneColors.decode(colorsData) == .defaults)
+    check("five distinct tray icons", Set(TrayState.allCases.map(trayIconSpec)).count == TrayState.allCases.count)
+    let mappedSettings = migratedSettings(from: ["showCrossingZone": false, "unrelated": true])
+    check("legacy settings key mapping", mappedSettings.count == 1 && mappedSettings["showCrossingZone"] as? Bool == false)
+    let today = Date()
+    check("same-day last change format", formattedLastChange(today, now: today).count == 5)
+    let yesterday = checked("previous calendar day", Calendar.current.date(byAdding: .day, value: -1, to: today))
+    check("earlier last change format", formattedLastChange(yesterday, now: today).count == 11)
 }
 
 @MainActor
@@ -244,6 +319,13 @@ final class ConnectionMonitor: ObservableObject {
     @Published private(set) var iPadPosition: IPadPosition?
     @Published private(set) var sessionSubstate: SessionSubstate?
     @Published private(set) var configuredDevicesEmpty = false
+    @Published private(set) var reconnectStatus: String?
+    @Published var zoneColors = ZoneColors.load() {
+        didSet {
+            zoneColors.save()
+            updateOverlay()
+        }
+    }
     @Published var showCrossingZone: Bool = UserDefaults.standard.object(forKey: "showCrossingZone") as? Bool ?? true {
         didSet {
             UserDefaults.standard.set(showCrossingZone, forKey: "showCrossingZone")
@@ -273,7 +355,11 @@ final class ConnectionMonitor: ObservableObject {
     private let overlay = OverlayController()
     private var screenObserver: NSObjectProtocol?
 
-    init() {
+    init(previewOnly: Bool = false) {
+        if previewOnly {
+            reconnectStatus = "[RECONNECTING...]"
+            return
+        }
         let defaults = UserDefaults.standard
         if let savedState = defaults.string(forKey: "lastConnectionState").flatMap(ConnectionState.init(rawValue:)) {
             state = savedState
@@ -378,8 +464,9 @@ final class ConnectionMonitor: ObservableObject {
                     reconnectPending = false
                     reconnectTimeoutTask?.cancel()
                     reconnectTimeoutTask = nil
+                    reconnectStatus = nil
                     update(to: .connected, replay: replay, timestamp: timestamp)
-                    if !replay, wasReconnecting && previous == .connected { notify("Universal Control reconnected") }
+                    if !replay, wasReconnecting && previous == .connected { notify("Crossover reconnected") }
                 }
             case .configuredDevices(let devices):
                 configuredDevicesEmpty = devices.isEmpty
@@ -392,6 +479,7 @@ final class ConnectionMonitor: ObservableObject {
                     reconnectTimeoutTask = nil
                     reconnectPending = false
                     lastReconnectAt = nil
+                    reconnectStatus = nil
                 } else if !replay, state == .disconnected {
                     beginAutoReconnect()
                 }
@@ -441,7 +529,7 @@ final class ConnectionMonitor: ObservableObject {
             autoReconnectAttempts = 0
         }
         guard shouldNotify(previous: previous, next: next, replay: replay) else { return }
-        notify(next == .connected ? "Universal Control reconnected" : configuredDevicesEmpty ? "Universal Control turned off" : "Universal Control disconnected")
+        notify(next == .connected ? "Crossover reconnected" : configuredDevicesEmpty ? "Crossover turned off" : "Crossover disconnected")
     }
 
     func reconnectNow() {
@@ -466,18 +554,48 @@ final class ConnectionMonitor: ObservableObject {
 
     private func updateOverlay() {
         overlay.update(segments: crossingSegments, state: state, session: sessionSubstate,
-                       enabled: showCrossingZone, universalControlOff: configuredDevicesEmpty)
+                       colors: zoneColors, enabled: showCrossingZone, universalControlOff: configuredDevicesEmpty)
     }
 
-    var positionDescription: String {
+    var positionLines: [String] {
         if !crossingSegments.isEmpty {
-            return crossingSegments.sorted { $0.startFraction < $1.startFraction }.map(\.description).joined(separator: ", ")
+            return crossingSegments.sorted { $0.startFraction < $1.startFraction }.map(\.description)
         }
-        return iPadPosition?.description ?? "Unknown"
+        return iPadPosition.map { [$0.description] } ?? ["UNKNOWN"]
     }
+
+    var trayState: TrayState {
+        if configuredDevicesEmpty { return .off }
+        if state == .connected { return sessionSubstate == .inUse ? .connected : .standby }
+        if state == .disconnected { return .disconnected }
+        return .unknown
+    }
+
+    var trayAccessibilityLabel: String {
+        if reconnectStatus == "[RECONNECTING...]" { return "Crossover: reconnecting" }
+        return switch trayState {
+        case .connected: "Crossover: connected"
+        case .standby: "Crossover: standby"
+        case .disconnected: "Crossover: disconnected"
+        case .off: "Crossover: off"
+        case .unknown: "Crossover: unknown"
+        }
+    }
+
+    func setZoneColor(_ role: ZoneColorRole, color: NSColor) {
+        let value = RGBAColor(color)
+        switch role {
+        case .connected: zoneColors.connected = value
+        case .standby: zoneColors.standby = value
+        case .disconnected: zoneColors.disconnected = value
+        }
+    }
+
+    func resetZoneColors() { zoneColors = .defaults }
 
     private func reconnect() {
         reconnectPending = true
+        reconnectStatus = "[RECONNECTING...]"
         lastReconnectAt = Date()
         reconnectTimeoutTask?.cancel()
         reconnectTimeoutTask = Task { @MainActor in
@@ -485,6 +603,7 @@ final class ConnectionMonitor: ObservableObject {
             guard !Task.isCancelled, reconnectPending else { return }
             reconnectPending = false
             reconnectTimeoutTask = nil
+            reconnectStatus = "[FAILED]"
             update(to: .disconnected)
         }
         let process = Process()
@@ -521,7 +640,8 @@ final class ConnectionMonitor: ObservableObject {
             case .failed:
                 autoReconnectTask = nil
                 reconnectPending = false
-                notify("Universal Control auto-reconnect failed")
+                reconnectStatus = "[FAILED]"
+                notify("Crossover auto-reconnect failed")
             case .disabled, .schedule:
                 autoReconnectTask = nil
             }
@@ -529,35 +649,113 @@ final class ConnectionMonitor: ObservableObject {
     }
 }
 
-@main
-struct UniversalControlHelperApp: App {
-    @StateObject private var monitor: ConnectionMonitor
+@MainActor
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    private lazy var monitor = ConnectionMonitor()
+    private let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+    private let popover = NSPopover()
+    private let redDot = CALayer()
+    private var iconTimer: Timer?
+    private var monitorChanges: AnyCancellable?
 
-    init() {
+    override init() {
         if CommandLine.arguments.contains("--self-check") {
             parserSelfCheck()
             exit(0)
         }
-        _monitor = StateObject(wrappedValue: ConnectionMonitor())
+        migrateLegacySettings(newDefaults: .standard, newDomain: "com.local.crossover",
+                              oldDefaults: UserDefaults(suiteName: legacySettingsDomain)!)
+        FontRegistrar.register()
+        super.init()
+    }
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        statusItem.autosaveName = "CrossoverStatusItem"
+        statusItem.isVisible = true
+        guard let button = statusItem.button else { return }
+        button.target = self
+        button.action = #selector(togglePopover)
+        button.imagePosition = .imageOnly
+        button.wantsLayer = true
+        redDot.backgroundColor = NSColor(srgbRed: 0.843, green: 0.098, blue: 0.129, alpha: 1).cgColor
+        redDot.cornerRadius = 2.5
+        button.layer?.addSublayer(redDot)
+
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 320, height: 560)
+        let hostingController = NSHostingController(rootView: NothingPopover(monitor: monitor))
+        hostingController.sizingOptions = [.preferredContentSize]
+        popover.contentViewController = hostingController
+        monitorChanges = monitor.objectWillChange.sink { [weak self] _ in
+            DispatchQueue.main.async { self?.updateStatusIcon() }
+        }
+        iconTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated { self?.updateStatusIcon() }
+        }
+        updateStatusIcon()
         UNUserNotificationCenter.current().requestAuthorization(options: [.alert, .sound]) { _, _ in }
     }
 
-    var body: some Scene {
-        MenuBarExtra("UC \(monitor.state.rawValue.capitalized)", systemImage: monitor.state == .connected ? "link" : "link.slash") {
-            Text("State: \(monitor.state.rawValue.capitalized)")
-            if monitor.state == .connected {
-                Text("Session: \(monitor.sessionSubstate?.rawValue ?? "standby")")
-            }
-            Text("Last change: \(monitor.changedAt?.formatted(date: .abbreviated, time: .standard) ?? "Never")")
-            Text("iPad position: \(monitor.positionDescription)")
-            if monitor.configuredDevicesEmpty { Text("Universal Control off (in settings?)") }
-            Divider()
-            Button("Reconnect now") { monitor.reconnectNow() }
-            Toggle("Auto-reconnect", isOn: $monitor.autoReconnectEnabled)
-            Toggle("Show crossing zone", isOn: $monitor.showCrossingZone)
-            Divider()
-            Button("Quit") { NSApplication.shared.terminate(nil) }
+    @objc private func togglePopover() {
+        guard let button = statusItem.button else { return }
+        if popover.isShown {
+            popover.performClose(nil)
+        } else {
+            popover.show(relativeTo: button.bounds, of: button, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.initialFirstResponder = nil
         }
-        .menuBarExtraStyle(.window)
+    }
+
+    private func updateStatusIcon() {
+        guard let button = statusItem.button else { return }
+        let pulse = Int(Date().timeIntervalSinceReferenceDate) % 2 == 0
+        let spec = monitor.reconnectStatus == "[RECONNECTING...]" && pulse
+            ? TrayIconSpec(symbol: "ellipsis.circle", opacity: 1, showsRedDot: false)
+            : trayIconSpec(for: monitor.trayState)
+        let image = NSImage(systemSymbolName: spec.symbol, accessibilityDescription: monitor.trayAccessibilityLabel)?
+            .withSymbolConfiguration(.init(pointSize: 14, weight: .medium))
+        image?.isTemplate = true
+        button.image = image
+        button.alphaValue = spec.opacity
+        button.setAccessibilityLabel(monitor.trayAccessibilityLabel)
+        redDot.isHidden = !spec.showsRedDot
+        redDot.frame = CGRect(x: button.bounds.maxX - 7, y: 2, width: 5, height: 5)
+    }
+}
+
+@main
+enum CrossoverApp {
+    @MainActor
+    static func main() {
+        #if DEBUG
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--render-preview" {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            FontRegistrar.register()
+            do {
+                try renderPreviews(to: CommandLine.arguments[2])
+                exit(0)
+            } catch {
+                fputs("Preview render failed: \(error)\n", stderr)
+                exit(1)
+            }
+        }
+        if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--render-icons" {
+            NSApplication.shared.setActivationPolicy(.accessory)
+            do {
+                try renderTrayIconSheet(to: CommandLine.arguments[2])
+                exit(0)
+            } catch {
+                fputs("Icon render failed: \(error)\n", stderr)
+                exit(1)
+            }
+        }
+        #endif
+        let app = NSApplication.shared
+        let delegate = AppDelegate()
+        app.delegate = delegate
+        app.setActivationPolicy(.accessory)
+        withExtendedLifetime(delegate) {
+            app.run()
+        }
     }
 }

@@ -2,9 +2,9 @@
 import PackageDescription
 
 let package = Package(
-    name: "UniversalControlHelper",
+    name: "Crossover",
     platforms: [.macOS(.v14)],
-    products: [.executable(name: "UniversalControlHelper", targets: ["UniversalControlHelper"])],
+    products: [.executable(name: "Crossover", targets: ["Crossover"])],
     dependencies: [],
-    targets: [.executableTarget(name: "UniversalControlHelper")]
+    targets: [.executableTarget(name: "Crossover", resources: [.copy("Resources")])]
 )

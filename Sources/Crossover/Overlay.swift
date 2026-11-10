@@ -1,6 +1,51 @@
 import AppKit
 import ColorSync
 
+struct RGBAColor: Codable, Equatable {
+    let red: Double
+    let green: Double
+    let blue: Double
+    let alpha: Double
+
+    var nsColor: NSColor { NSColor(srgbRed: red, green: green, blue: blue, alpha: alpha) }
+
+    init(red: Double, green: Double, blue: Double, alpha: Double) {
+        self.red = red
+        self.green = green
+        self.blue = blue
+        self.alpha = alpha
+    }
+
+    init(_ color: NSColor) {
+        let color = color.usingColorSpace(.sRGB) ?? color
+        red = color.redComponent
+        green = color.greenComponent
+        blue = color.blueComponent
+        alpha = color.alphaComponent
+    }
+}
+
+struct ZoneColors: Codable, Equatable {
+    var connected: RGBAColor
+    var standby: RGBAColor
+    var disconnected: RGBAColor
+
+    static let defaults = ZoneColors(
+        connected: RGBAColor(red: 0.204, green: 0.780, blue: 0.349, alpha: 0.5),
+        standby: RGBAColor(red: 0, green: 0.478, blue: 1, alpha: 0.4),
+        disconnected: RGBAColor(red: 1, green: 0.231, blue: 0.188, alpha: 0.3)
+    )
+
+    func encoded() -> Data? { try? JSONEncoder().encode(self) }
+    func save() {
+        if let data = encoded() { UserDefaults.standard.set(data, forKey: "zoneColors") }
+    }
+    static func decode(_ data: Data) -> ZoneColors? { try? JSONDecoder().decode(ZoneColors.self, from: data) }
+    static func load() -> ZoneColors {
+        UserDefaults.standard.data(forKey: "zoneColors").flatMap(decode) ?? .defaults
+    }
+}
+
 let zeroDisplayUUID = "00000000-0000-0000-0000-000000000000"
 
 struct DisplayLayoutEntry: Equatable {
@@ -15,9 +60,30 @@ struct CrossingSegment: Equatable {
     let endFraction: Double
 }
 
+private struct CrossingSegmentKey: Hashable {
+    let displayUUID: String
+    let edge: ScreenEdge
+}
+
+private extension CrossingSegment {
+    var key: CrossingSegmentKey { CrossingSegmentKey(displayUUID: displayUUID, edge: edge) }
+}
+
+func overlayFrame(_ segment: CrossingSegment, screenFrame frame: CGRect) -> CGRect {
+    let start = CGFloat(segment.startFraction)
+    let end = CGFloat(segment.endFraction)
+    return switch segment.edge {
+    case .bottom: CGRect(x: frame.minX + frame.width * start, y: frame.minY, width: frame.width * (end - start), height: 6)
+    case .top: CGRect(x: frame.minX + frame.width * start, y: frame.maxY - 6, width: frame.width * (end - start), height: 6)
+    case .left: CGRect(x: frame.minX, y: frame.maxY - frame.height * end, width: 6, height: frame.height * (end - start))
+    case .right: CGRect(x: frame.maxX - 6, y: frame.maxY - frame.height * end, width: 6, height: frame.height * (end - start))
+    }
+}
+
 func parseDisplayLayout(_ line: String) -> [DisplayLayoutEntry]? {
     guard let label = line.range(of: "displayLayout:") else { return nil }
     let layoutText = String(line[label.upperBound...])
+    guard !layoutText.contains("<…>") else { return nil }
     let pattern = #"[A-Fa-f0-9]+:([A-Fa-f0-9-]+): CGRect\((-?[0-9.]+), (-?[0-9.]+), ([0-9.]+), ([0-9.]+)\)"#
     let regex = try! NSRegularExpression(pattern: pattern)
     let text = layoutText as NSString
@@ -80,53 +146,56 @@ func screen(for displayUUID: String) -> NSScreen? {
 extension IPadPosition {
     var description: String {
         let name = screen(for: displayUUID)?.localizedName ?? "Mac screen"
-        return "\(edge.iPadDirection) \(name)"
+        return "\(edge.positionLabel) · \(name)"
     }
 }
 
 extension CrossingSegment {
     var description: String {
         let name = screen(for: displayUUID)?.localizedName ?? "Mac screen"
-        return "\(edge.iPadDirection) \(name) (\(Int((startFraction * 100).rounded()))-\(Int((endFraction * 100).rounded()))%)"
+        return "\(edge.positionLabel) · \(name) · \(Int((startFraction * 100).rounded()))-\(Int((endFraction * 100).rounded()))%"
     }
 }
 
 @MainActor
 final class OverlayController {
-    private var windows: [NSWindow] = []
+    private var windows: [CrossingSegmentKey: NSWindow] = [:]
 
     func update(segments: [CrossingSegment], state: ConnectionState, session: SessionSubstate?,
-                enabled: Bool, universalControlOff: Bool) {
-        windows.forEach { $0.close() }
-        windows = []
-        guard enabled, !universalControlOff, state != .unknown else { return }
-        let color: NSColor = state == .disconnected
-            ? .systemRed.withAlphaComponent(0.3)
-            : session == .standby ? .systemBlue.withAlphaComponent(0.4) : .systemGreen.withAlphaComponent(0.5)
+                colors: ZoneColors, enabled: Bool, universalControlOff: Bool) {
+        guard enabled, !universalControlOff, state != .unknown else {
+            windows.values.forEach { $0.close() }
+            windows.removeAll()
+            return
+        }
+        let color = state == .disconnected
+            ? colors.disconnected.nsColor
+            : session == .standby ? colors.standby.nsColor : colors.connected.nsColor
+        let activeKeys = Set(segments.map(\.key))
+        for key in Array(windows.keys) where !activeKeys.contains(key) {
+            windows.removeValue(forKey: key)?.close()
+        }
         for segment in segments {
-            guard let screen = screen(for: segment.displayUUID) else { continue }
-            let frame = overlayFrame(segment, screen: screen)
-            let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
-            window.isReleasedWhenClosed = false
+            guard let screen = screen(for: segment.displayUUID) else {
+                windows.removeValue(forKey: segment.key)?.close()
+                continue
+            }
+            let frame = overlayFrame(segment, screenFrame: screen.frame)
+            let window = windows[segment.key] ?? makeWindow(frame: frame)
+            window.setFrame(frame, display: true)
             window.backgroundColor = color
-            window.isOpaque = false
-            window.ignoresMouseEvents = true
-            window.level = .statusBar
-            window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
             window.orderFrontRegardless()
-            windows.append(window)
+            windows[segment.key] = window
         }
     }
 
-    private func overlayFrame(_ segment: CrossingSegment, screen: NSScreen) -> CGRect {
-        let frame = screen.frame
-        let start = CGFloat(segment.startFraction)
-        let end = CGFloat(segment.endFraction)
-        switch segment.edge {
-        case .bottom: return CGRect(x: frame.minX + frame.width * start, y: frame.minY, width: frame.width * (end - start), height: 6)
-        case .top: return CGRect(x: frame.minX + frame.width * start, y: frame.maxY - 6, width: frame.width * (end - start), height: 6)
-        case .left: return CGRect(x: frame.minX, y: frame.maxY - frame.height * end, width: 6, height: frame.height * (end - start))
-        case .right: return CGRect(x: frame.maxX - 6, y: frame.maxY - frame.height * end, width: 6, height: frame.height * (end - start))
-        }
+    private func makeWindow(frame: CGRect) -> NSWindow {
+        let window = NSWindow(contentRect: frame, styleMask: .borderless, backing: .buffered, defer: false)
+        window.isReleasedWhenClosed = false
+        window.isOpaque = false
+        window.ignoresMouseEvents = true
+        window.level = .statusBar
+        window.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle, .fullScreenAuxiliary]
+        return window
     }
 }
