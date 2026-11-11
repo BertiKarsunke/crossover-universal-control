@@ -143,7 +143,7 @@ struct NothingPopover: View {
     @FocusState private var focusedControl: PopoverControl?
 
     private enum PopoverControl: Hashable {
-        case reconnect, settings, autoReconnect, crossingZone, connectedColor, disconnectedColor, resetColors, quit
+        case reconnect, settings, autoReconnect, crossingZone, launchAtLogin, loginItems, connectedColor, disconnectedColor, resetColors, quit
     }
 
     private var tokens: PopoverTokens { PopoverTokens(previewScheme ?? scheme) }
@@ -260,11 +260,38 @@ struct NothingPopover: View {
                         PopoverToggle(label: "Show crossing zone", isOn: $monitor.showCrossingZone,
                                       tokens: tokens, focused: focusedControl == .crossingZone)
                             .focused($focusedControl, equals: .crossingZone)
+                        PopoverToggle(label: "Open at login", isOn: launchAtLoginBinding,
+                                      tokens: tokens, focused: focusedControl == .launchAtLogin,
+                                      enabled: monitor.canLaunchAtLogin)
+                            .focused($focusedControl, equals: .launchAtLogin)
+                        if monitor.canLaunchAtLogin {
+                            Text("Open at login: \(monitor.loginItemStatusLabel)")
+                                .font(tokens.bodySmall)
+                                .foregroundStyle(tokens.textSecondary)
+                        } else {
+                            Text("Move Crossover to Applications to enable Open at login")
+                                .font(tokens.caption)
+                                .foregroundStyle(tokens.textSecondary)
+                        }
+                        if monitor.loginItemNeedsApproval {
+                            Button("Approve in System Settings › Login Items") { monitor.openLoginItemsSettings() }
+                                .buttonStyle(PopoverButtonStyle(tokens: tokens, kind: .text))
+                                .popoverFocusRing(focusedControl == .loginItems, tokens: tokens, radius: 8)
+                                .focused($focusedControl, equals: .loginItems)
+                        }
+                        if let error = monitor.loginItemError {
+                            Text(error).font(tokens.caption).foregroundStyle(tokens.textSecondary)
+                        }
+                        if let osLabel = monitor.unverifiedOSLabel {
+                            Text(osLabel)
+                                .font(tokens.caption)
+                                .foregroundStyle(tokens.textSecondary)
+                        }
 
                         Text("Crossing zone colors")
                             .font(tokens.bodySmall)
                             .foregroundStyle(tokens.textSecondary)
-                            .padding(.top, 4)
+                            .padding(.top, 12)
                         ForEach(ZoneColorRole.allCases, id: \.self) { role in
                             HStack {
                                 Text(role.label)
@@ -283,6 +310,7 @@ struct NothingPopover: View {
                                     .onHover { hoveredColorPicker = $0 ? role : nil }
                             }
                             .frame(minHeight: 32)
+                            .padding(.trailing, 5)
                         }
 
                         HStack {
@@ -293,7 +321,6 @@ struct NothingPopover: View {
                                 .focused($focusedControl, equals: .resetColors)
                         }
                     }
-                    .padding(.leading, 8)
                     .transition(reduceMotion ? .identity : .opacity)
                 }
             }
@@ -329,11 +356,17 @@ struct NothingPopover: View {
     }
 
     private var reconnectMessage: String? {
-        switch monitor.reconnectStatus {
+        if monitor.logFormatUnrecognized { return "Log format not recognized" }
+        if monitor.logStreamUnavailable { return "Log stream unavailable" }
+        return switch monitor.reconnectStatus {
         case "[RECONNECTING...]": "Reconnecting…"
         case "[FAILED]": "Couldn’t reconnect"
         default: nil
         }
+    }
+
+    private var launchAtLoginBinding: Binding<Bool> {
+        Binding(get: { monitor.launchAtLoginEnabled }, set: { monitor.setLaunchAtLogin($0) })
     }
 
     private func positionText(_ line: String) -> Text {
@@ -363,6 +396,7 @@ private struct PopoverToggle: View {
     @Binding var isOn: Bool
     let tokens: PopoverTokens
     let focused: Bool
+    var enabled = true
 
     var body: some View {
         Button { isOn.toggle() } label: {
@@ -391,6 +425,7 @@ private struct PopoverToggle: View {
         .accessibilityLabel(label)
         .accessibilityValue(isOn ? "On" : "Off")
         .accessibilityAddTraits(.isButton)
+        .disabled(!enabled)
     }
 }
 

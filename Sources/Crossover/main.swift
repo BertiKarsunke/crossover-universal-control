@@ -1,5 +1,6 @@
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -108,6 +109,41 @@ enum ReconnectDecision: Equatable {
     case ignoreDisconnect, schedule(TimeInterval), reconnect, failed, disabled
 }
 
+enum DelayedDisconnectNotice: Equatable {
+    case wait, sendDisconnect, sendRecovered, none
+}
+
+enum ReconnectTrigger: String {
+    case auto, manual
+}
+
+func reconnectSuppressed(asleep: Bool, now: Date, wakeGraceUntil: Date?) -> Bool {
+    asleep || wakeGraceUntil.map { now < $0 } == true
+}
+
+func nextParseFailureCount(current: Int, recognized: Bool, parsed: Bool) -> Int {
+    guard recognized else { return current }
+    return parsed ? 0 : current + 1
+}
+
+func isLogFormatUnrecognized(failures: Int) -> Bool { failures >= 5 }
+
+func delayedDisconnectNotice(elapsed: TimeInterval, recovered: Bool, disconnectWasSent: Bool) -> DelayedDisconnectNotice {
+    if recovered { return disconnectWasSent ? .sendRecovered : .none }
+    return elapsed >= 20 && !disconnectWasSent ? .sendDisconnect : .wait
+}
+
+func logRestartDelay(failures: Int) -> TimeInterval {
+    guard failures >= 5 else { return 2 }
+    return min(60, 2 * pow(2, Double(failures - 5)))
+}
+
+let lastVerifiedOS = OperatingSystemVersion(majorVersion: 26, minorVersion: 6, patchVersion: 2)
+
+func needsOSVerification(current: OperatingSystemVersion, verified: OperatingSystemVersion = lastVerifiedOS) -> Bool {
+    current.majorVersion != verified.majorVersion || current.minorVersion != verified.minorVersion
+}
+
 func reconnectDecision(autoEnabled: Bool, configuredDevicesEmpty: Bool = false, attempts: Int, secondsSinceReconnect: TimeInterval?, timerExpired: Bool) -> ReconnectDecision {
     if let elapsed = secondsSinceReconnect, elapsed < 10 { return .ignoreDisconnect }
     guard autoEnabled, !configuredDevicesEmpty else { return .disabled }
@@ -140,10 +176,6 @@ func sessionSubstateAfter(_ event: ConnectionEvent, state: ConnectionState) -> S
     case .peerStandby, .sourceChanged: return .standby
     default: return nil
     }
-}
-
-func shouldNotify(previous: ConnectionState, next: ConnectionState, replay: Bool = false) -> Bool {
-    !replay && ((previous == .connected && next == .disconnected) || (previous == .disconnected && next == .connected))
 }
 
 func shouldNotifyReconnect(pending: Bool, event: ConnectionEvent) -> Bool {
@@ -213,6 +245,50 @@ func parseEvents(_ line: String) -> [ConnectionEvent] {
 
 func parseEvent(_ line: String) -> ConnectionEvent? { parseEvents(line).first }
 
+func recognizedParseOutcomes(_ line: String) -> [Bool] {
+    var outcomes: [Bool] = []
+    if line.contains("[com.apple.universalcontrol:CONN]"),
+       line.contains("Connected, update connections:") || line.contains(realDropPattern) {
+        outcomes.append(parseConnections(line) != nil)
+    }
+    if line.contains("displayLayout:"), line.contains("CGRect(") {
+        outcomes.append(parseDisplayLayout(line) != nil)
+    }
+    return outcomes
+}
+
+func replayedConnectionState(_ lines: [String]) -> (state: ConnectionState, failures: Int) {
+    var state = ConnectionState.unknown
+    var failures = 0
+    for line in lines {
+        let outcomes = recognizedParseOutcomes(line)
+        if !outcomes.isEmpty {
+            failures = nextParseFailureCount(current: failures, recognized: true, parsed: !outcomes.contains(false))
+        }
+        for event in parseEvents(line) {
+            guard case .connections(let peers, _) = event, let peers else { continue }
+            state = stateAfter(peers, current: state)
+        }
+    }
+    return (state, failures)
+}
+
+func replayedMonitorState(_ lines: [String], initialState: ConnectionState) -> (state: ConnectionState, configuredDevicesEmpty: Bool) {
+    var state = initialState
+    var configuredDevicesEmpty = false
+    for line in lines {
+        for event in parseEvents(line) {
+            switch event {
+            case .connections(let peers, _):
+                if let peers { state = stateAfter(peers, current: state) }
+            case .configuredDevices(let devices): configuredDevicesEmpty = devices.isEmpty
+            default: break
+            }
+        }
+    }
+    return (state, configuredDevicesEmpty)
+}
+
 func parseConnections(_ line: String) -> [PeerConnection]? {
     guard let arrow = line.range(of: "->"),
           let open = line[arrow.upperBound...].firstIndex(of: "["),
@@ -263,10 +339,12 @@ func parserSelfCheck() {
     check("CONN connected peers", connectedEvent == .connections([PeerConnection(id: "0D685417", status: "connected")], connectedSignal: true))
     check("CONN connected state", stateAfter(connectedEvent, current: .unknown) == .connected)
     let disconnectedEvent = checked("parse CONN disconnected", parseEvent(disconnected))
+    check("recognized CONN line parses", recognizedParseOutcomes(disconnected) == [true])
+    check("malformed connection CONN line fails parse", recognizedParseOutcomes("[com.apple.universalcontrol:CONN] Disconnected peer, update connections: malformed") == [false])
+    check("unhandled CONN line is ignored", recognizedParseOutcomes("[com.apple.universalcontrol:CONN] Configured Devices Changed, update connections: [] -> [peer (pending)]").isEmpty)
+    check("layout without rectangles is ignored", recognizedParseOutcomes("[com.apple.universalcontrol:SYNC] displayLayout: [V: '']").isEmpty)
     check("CONN disconnected state", stateAfter(disconnectedEvent, current: .connected) == .disconnected)
     check("disconnect does not confirm reconnect", !shouldNotifyReconnect(pending: true, event: disconnectedEvent))
-    check("disconnect notification decision", shouldNotify(previous: .connected, next: .disconnected))
-    check("replay suppresses notification", !shouldNotify(previous: .connected, next: .disconnected, replay: true))
     let multiPeerEvent = checked("parse multi-peer connection", parseEvent(anotherPeerConnected))
     check("remaining connected peer", stateAfter(multiPeerEvent, current: .connected) == .connected)
     let configuredEvent = checked("parse Configured Devices empty", parseEvent(configuredEmpty))
@@ -330,8 +408,45 @@ func parserSelfCheck() {
     check("log timestamp value", logTimestampFormatter.string(from: timestamp) == "2026-11-10 13:15:32.584")
     check("invalid log timestamp", parseLogTimestamp("not a log line") == nil)
     check("unrelated log ignored", parseEvent("unrelated log line") == nil)
+    let captureURL = URL(fileURLWithPath: FileManager.default.currentDirectoryPath)
+        .appendingPathComponent(".omc/captures/uc_drop_test.log")
+    if let capture = try? String(contentsOf: captureURL, encoding: .utf8) {
+        let lines = capture.components(separatedBy: .newlines)
+        let lastDisconnect = lines.lastIndex(where: { $0.contains(realDropPattern) })
+        if let lastDisconnect {
+            let trace = lines[...lastDisconnect].filter {
+                $0.contains("[com.apple.universalcontrol:CONN]") ||
+                $0.contains("[com.apple.universalcontrol:SYNC]") ||
+                $0.contains("[com.apple.universalcontrol:PEER]") ||
+                $0.contains("[com.apple.universalcontrol:LINK]")
+            }
+            let replay = replayedConnectionState(Array(trace))
+            check("captured UC drop trace has no parse failures", replay.failures == 0)
+            check("captured UC drop trace ends disconnected", replay.state == .disconnected)
+        }
+    }
+    for initialState in [ConnectionState.unknown, .connected] {
+        let replay = replayedMonitorState([configuredEmpty, disconnected], initialState: initialState)
+        check("startup replay preserves final disconnect from \(initialState.rawValue)", replay.state == .disconnected && replay.configuredDevicesEmpty)
+    }
     check("reconnect grace", reconnectDecision(autoEnabled: true, attempts: 0, secondsSinceReconnect: 5, timerExpired: false) == .ignoreDisconnect)
     check("reconnect attempt limit", reconnectDecision(autoEnabled: true, attempts: 3, secondsSinceReconnect: nil, timerExpired: true) == .failed)
+    check("initial auto reconnect remains 15 seconds", reconnectDecision(autoEnabled: true, attempts: 0, secondsSinceReconnect: nil, timerExpired: false) == .schedule(15))
+    let now = Date()
+    let wakeGrace = now.addingTimeInterval(20)
+    check("disconnect during sleep is suppressed", reconnectSuppressed(asleep: true, now: now, wakeGraceUntil: nil))
+    check("disconnect during wake grace is suppressed", reconnectSuppressed(asleep: false, now: now.addingTimeInterval(19), wakeGraceUntil: wakeGrace))
+    check("reconnect allowed after wake grace", !reconnectSuppressed(asleep: false, now: wakeGrace, wakeGraceUntil: wakeGrace))
+    var parseFailures = 0
+    for _ in 0..<5 { parseFailures = nextParseFailureCount(current: parseFailures, recognized: true, parsed: false) }
+    check("five recognized parse failures reach threshold", parseFailures == 5 && isLogFormatUnrecognized(failures: parseFailures))
+    check("four parse failures stay below threshold", !isLogFormatUnrecognized(failures: 4))
+    check("successful recognized parse resets failures", nextParseFailureCount(current: 4, recognized: true, parsed: true) == 0)
+    check("unrelated log leaves parse failures unchanged", nextParseFailureCount(current: 4, recognized: false, parsed: false) == 4)
+    check("16 second drop recovers silently", delayedDisconnectNotice(elapsed: 16, recovered: false, disconnectWasSent: false) == .wait && delayedDisconnectNotice(elapsed: 16, recovered: true, disconnectWasSent: false) == .none)
+    check("25 second drop sends disconnect and recovery", delayedDisconnectNotice(elapsed: 20, recovered: false, disconnectWasSent: false) == .sendDisconnect && delayedDisconnectNotice(elapsed: 25, recovered: true, disconnectWasSent: true) == .sendRecovered)
+    check("log restart backoff caps at 60 seconds", logRestartDelay(failures: 5) == 2 && logRestartDelay(failures: 6) == 4 && logRestartDelay(failures: 20) == 60)
+    check("verified OS major minor", !needsOSVerification(current: lastVerifiedOS) && needsOSVerification(current: OperatingSystemVersion(majorVersion: 27, minorVersion: 0, patchVersion: 0)))
     let colorsData = checked("zone colors encode", ZoneColors.defaults.encoded())
     check("zone colors round trip", ZoneColors.decode(colorsData) == .defaults)
     check("five distinct tray icons", Set(TrayState.allCases.map(trayIconSpec)).count == TrayState.allCases.count)
@@ -343,6 +458,40 @@ func parserSelfCheck() {
     check("earlier last change format", formattedLastChange(yesterday, now: today).count == 11)
 }
 
+private final class ReconnectLog {
+    private let queue = DispatchQueue(label: "com.local.crossover.reconnect-log", qos: .utility)
+    private let fileURL = FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent("Library/Logs/Crossover/reconnect.log")
+    private let limit = 1_000_000
+
+    func append(event: String, trigger: ReconnectTrigger, attempt: Int, secondsSinceDisconnect: TimeInterval?) {
+        queue.async { [fileURL, limit] in
+            let formatter = ISO8601DateFormatter()
+            let record: [String: Any] = [
+                "ts": formatter.string(from: Date()),
+                "event": event,
+                "trigger": trigger.rawValue,
+                "attempt": attempt,
+                "secondsSinceDisconnect": secondsSinceDisconnect.map { $0 as Any } ?? NSNull()
+            ]
+            guard var data = try? JSONSerialization.data(withJSONObject: record, options: [.sortedKeys]) else { return }
+            data.append(0x0A)
+            let manager = FileManager.default
+            try? manager.createDirectory(at: fileURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            if let size = (try? manager.attributesOfItem(atPath: fileURL.path)[.size]) as? NSNumber, size.intValue + data.count > limit {
+                let rotated = fileURL.appendingPathExtension("1")
+                try? manager.removeItem(at: rotated)
+                try? manager.moveItem(at: fileURL, to: rotated)
+            }
+            if !manager.fileExists(atPath: fileURL.path) { manager.createFile(atPath: fileURL.path, contents: nil) }
+            guard let handle = try? FileHandle(forWritingTo: fileURL) else { return }
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: data)
+        }
+    }
+}
+
 @MainActor
 final class ConnectionMonitor: ObservableObject {
     @Published private(set) var state: ConnectionState = .unknown
@@ -352,6 +501,12 @@ final class ConnectionMonitor: ObservableObject {
     @Published private(set) var configuredDevicesEmpty = false
     @Published private(set) var reconnectStatus: String?
     @Published private(set) var displayLayout: [DisplayLayoutEntry] = []
+    @Published private(set) var parseFailureCount = 0
+    @Published private(set) var logFormatUnrecognized = false
+    @Published private(set) var logStreamUnavailable = false
+    @Published private(set) var lastLogStreamErrorLine: String?
+    @Published private(set) var loginItemStatus = SMAppService.mainApp.status
+    @Published private(set) var loginItemError: String?
     @Published var zoneColors = ZoneColors.load() {
         didSet {
             zoneColors.save()
@@ -383,6 +538,24 @@ final class ConnectionMonitor: ObservableObject {
     private var lastReconnectAt: Date?
     private var reconnectPending = false
     private var reconnectTimeoutTask: Task<Void, Never>?
+    private let reconnectLog = ReconnectLog()
+    private var disconnectNotificationTask: Task<Void, Never>?
+    private var disconnectStartedAt: Date?
+    private var disconnectNotificationSent = false
+    private var gaveUpLoggedForDisconnect = false
+    private var disconnectTrigger: ReconnectTrigger = .auto
+    private var reconnectTrigger: ReconnectTrigger = .auto
+    private var reconnectAttempt = 0
+    private var disconnectAttempt = 0
+    private enum InactivitySource: Hashable { case systemSleep, displaySleep, sessionInactive }
+    private var inactivitySources: Set<InactivitySource> = []
+    private var wakeGraceUntil: Date?
+    private var wakeGraceTask: Task<Void, Never>?
+    private var lifecycleObservers: [NSObjectProtocol] = []
+    private var logRestartTask: Task<Void, Never>?
+    private var logStreamHealthTask: Task<Void, Never>?
+    private var logStreamFailureCount = 0
+    private var stderrPendingLine = ""
     @Published private(set) var crossingSegments: [CrossingSegment] = []
     private let overlay = OverlayController()
     private var screenObserver: NSObjectProtocol?
@@ -405,9 +578,103 @@ final class ConnectionMonitor: ObservableObject {
         screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.updateOverlay() }
         }
+        observeLifecycle()
         updateOverlay()
         start()
         recoverHistory()
+    }
+
+    var canLaunchAtLogin: Bool {
+        Bundle.main.bundleURL.resolvingSymlinksInPath().path.hasPrefix("/Applications/")
+    }
+
+    var launchAtLoginEnabled: Bool {
+        loginItemStatus == .enabled || loginItemStatus == .requiresApproval
+    }
+
+    var loginItemStatusLabel: String {
+        switch loginItemStatus {
+        case .enabled: "Enabled"
+        case .requiresApproval: "Approval required"
+        case .notFound: "Not found"
+        case .notRegistered: "Not registered"
+        @unknown default: "Unknown"
+        }
+    }
+
+    var loginItemNeedsApproval: Bool { loginItemStatus == .requiresApproval }
+
+    var unverifiedOSLabel: String? {
+        let version = ProcessInfo.processInfo.operatingSystemVersion
+        guard needsOSVerification(current: version) else { return nil }
+        return "Unverified on macOS \(version.majorVersion).\(version.minorVersion)"
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        guard canLaunchAtLogin else { return }
+        do {
+            if enabled { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+            loginItemError = nil
+        } catch {
+            loginItemError = error.localizedDescription
+        }
+        loginItemStatus = SMAppService.mainApp.status
+    }
+
+    func openLoginItemsSettings() {
+        SMAppService.openSystemSettingsLoginItems()
+    }
+
+    func refreshLoginItemStatus() {
+        loginItemStatus = SMAppService.mainApp.status
+    }
+
+    private func observeLifecycle() {
+        let center = NSWorkspace.shared.notificationCenter
+        let events: [(Notification.Name, InactivitySource, Bool)] = [
+            (NSWorkspace.willSleepNotification, .systemSleep, true),
+            (NSWorkspace.didWakeNotification, .systemSleep, false),
+            (NSWorkspace.screensDidSleepNotification, .displaySleep, true),
+            (NSWorkspace.screensDidWakeNotification, .displaySleep, false),
+            (NSWorkspace.sessionDidResignActiveNotification, .sessionInactive, true),
+            (NSWorkspace.sessionDidBecomeActiveNotification, .sessionInactive, false)
+        ]
+        lifecycleObservers = events.map { name, source, inactive in
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                MainActor.assumeIsolated { self?.setInactive(source, inactive: inactive) }
+            }
+        }
+    }
+
+    private func setInactive(_ source: InactivitySource, inactive: Bool) {
+        if source == .sessionInactive, !inactive { refreshLoginItemStatus() }
+        let wasInactive = !inactivitySources.isEmpty
+        if inactive { inactivitySources.insert(source) }
+        else { inactivitySources.remove(source) }
+        let isInactive = !inactivitySources.isEmpty
+        guard wasInactive != isInactive else { return }
+        if isInactive {
+            autoReconnectTask?.cancel()
+            autoReconnectTask = nil
+            wakeGraceTask?.cancel()
+            wakeGraceTask = nil
+            wakeGraceUntil = nil
+            disconnectNotificationTask?.cancel()
+            disconnectNotificationTask = nil
+        } else {
+            if process == nil { start() }
+            let deadline = Date().addingTimeInterval(20)
+            wakeGraceUntil = deadline
+            wakeGraceTask?.cancel()
+            wakeGraceTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(20))
+                guard !Task.isCancelled, inactivitySources.isEmpty, wakeGraceUntil == deadline else { return }
+                wakeGraceUntil = nil
+                autoReconnectAttempts = 0
+                if state == .disconnected { beginAutoReconnect() }
+            }
+        }
     }
 
     private func recoverHistory() {
@@ -438,13 +705,17 @@ final class ConnectionMonitor: ObservableObject {
     }
 
     func start() {
+        guard inactivitySources.isEmpty, process == nil else { return }
+        logRestartTask?.cancel()
+        logRestartTask = nil
         pendingOutput = ""
         let process = Process()
         let pipe = Pipe()
+        let errorPipe = Pipe()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/log")
         process.arguments = ["stream", "--style", "compact", "--predicate", "subsystem == \"com.apple.universalcontrol\""]
         process.standardOutput = pipe
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errorPipe
         self.process = process
 
         pipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
@@ -456,17 +727,64 @@ final class ConnectionMonitor: ObservableObject {
                 self.consumeLiveOutput(output)
             }
         }
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let data = handle.availableData
+            guard !data.isEmpty else { return }
+            let output = String(decoding: data, as: UTF8.self)
+            DispatchQueue.main.async { [weak self] in self?.consumeStderr(output) }
+        }
         process.terminationHandler = { [weak self] _ in
             pipe.fileHandleForReading.readabilityHandler = nil
+            errorPipe.fileHandleForReading.readabilityHandler = nil
             let leftover = String(decoding: pipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
+            let error = String(decoding: errorPipe.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
             DispatchQueue.main.async { [weak self] in
                 guard let self else { return }
                 if !leftover.isEmpty { self.consumeLiveOutput(leftover, flush: true) }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
+                self.consumeStderr(error, flush: true)
+                self.process = nil
+                self.logStreamHealthTask?.cancel()
+                guard self.inactivitySources.isEmpty else { return }
+                self.noteLogStreamFailure()
             }
         }
-        do { try process.run() } catch {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in self?.start() }
+        do {
+            try process.run()
+            logStreamHealthTask?.cancel()
+            logStreamHealthTask = Task { @MainActor in
+                try? await Task.sleep(for: .seconds(30))
+                guard !Task.isCancelled, self.process === process else { return }
+                self.logStreamFailureCount = 0
+                self.logStreamUnavailable = false
+            }
+        } catch {
+            self.process = nil
+            lastLogStreamErrorLine = error.localizedDescription
+            noteLogStreamFailure()
+        }
+    }
+
+    private func consumeStderr(_ output: String, flush: Bool = false) {
+        let lines = (stderrPendingLine + output).split(separator: "\n", omittingEmptySubsequences: false)
+        let complete = flush ? lines[...] : lines.dropLast()
+        for line in complete where !line.isEmpty { lastLogStreamErrorLine = String(line) }
+        stderrPendingLine = flush || output.hasSuffix("\n") ? "" : String(lines.last ?? "")
+    }
+
+    private func noteLogStreamFailure() {
+        logStreamFailureCount += 1
+        logStreamUnavailable = logStreamFailureCount >= 5
+        scheduleLogRestart()
+    }
+
+    private func scheduleLogRestart() {
+        guard logRestartTask == nil else { return }
+        let delay = logRestartDelay(failures: logStreamFailureCount)
+        logRestartTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(delay))
+            guard !Task.isCancelled else { return }
+            logRestartTask = nil
+            if inactivitySources.isEmpty { start() }
         }
     }
 
@@ -483,6 +801,11 @@ final class ConnectionMonitor: ObservableObject {
 
     private func processLine(_ line: String, replay: Bool) {
         let timestamp = replay ? parseLogTimestamp(line) : nil
+        let outcomes = recognizedParseOutcomes(line)
+        if !outcomes.isEmpty {
+            parseFailureCount = nextParseFailureCount(current: parseFailureCount, recognized: true, parsed: !outcomes.contains(false))
+            logFormatUnrecognized = isLogFormatUnrecognized(failures: parseFailureCount)
+        }
         for event in parseEvents(line) {
             switch event {
             case .connections(let peers, _):
@@ -493,12 +816,15 @@ final class ConnectionMonitor: ObservableObject {
                 } else if next == .connected {
                     let wasReconnecting = shouldNotifyReconnect(pending: reconnectPending, event: event)
                     let previous = state
-                    reconnectPending = false
                     reconnectTimeoutTask?.cancel()
                     reconnectTimeoutTask = nil
                     reconnectStatus = nil
                     update(to: .connected, replay: replay, timestamp: timestamp)
-                    if !replay, wasReconnecting && previous == .connected { notify("Crossover reconnected") }
+                    reconnectPending = false
+                    if !replay, wasReconnecting && previous == .connected {
+                        reconnectLog.append(event: "recovered", trigger: reconnectTrigger, attempt: reconnectAttempt,
+                                            secondsSinceDisconnect: elapsedSinceDisconnect)
+                    }
                 }
             case .configuredDevices(let devices):
                 configuredDevicesEmpty = devices.isEmpty
@@ -540,15 +866,45 @@ final class ConnectionMonitor: ObservableObject {
         }
     }
 
-    private func update(to next: ConnectionState, replay: Bool = false, timestamp: Date? = nil) {
+    private func update(to next: ConnectionState, replay: Bool = false, timestamp: Date? = nil,
+                        scheduleDisconnectNotice: Bool = true) {
         guard next != state else { return }
         let previous = state
         state = next
-        UserDefaults.standard.set(next.rawValue, forKey: "lastConnectionState")
+        if next != .unknown { UserDefaults.standard.set(next.rawValue, forKey: "lastConnectionState") }
         if replay { changedAt = timestamp ?? changedAt }
         else { changedAt = Date() }
+        if next == .disconnected {
+            disconnectStartedAt = replay ? timestamp : Date()
+            disconnectNotificationSent = false
+            disconnectTrigger = reconnectPending ? reconnectTrigger : .auto
+            disconnectAttempt = reconnectPending ? reconnectAttempt : 0
+            gaveUpLoggedForDisconnect = false
+            if !replay {
+                reconnectLog.append(event: "disconnect", trigger: disconnectTrigger, attempt: disconnectAttempt, secondsSinceDisconnect: 0)
+                if scheduleDisconnectNotice, previous == .connected,
+                   !reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) {
+                    scheduleDisconnectNotification()
+                }
+            }
+        }
         if next == .connected {
+            disconnectNotificationTask?.cancel()
+            disconnectNotificationTask = nil
+            if !replay, previous == .disconnected {
+                let trigger = reconnectPending ? reconnectTrigger : disconnectTrigger
+                let attempt = reconnectPending ? reconnectAttempt : disconnectAttempt
+                reconnectLog.append(event: "recovered", trigger: trigger, attempt: attempt,
+                                    secondsSinceDisconnect: elapsedSinceDisconnect)
+                if delayedDisconnectNotice(elapsed: elapsedSinceDisconnect ?? 0, recovered: true,
+                                           disconnectWasSent: disconnectNotificationSent) == .sendRecovered,
+                   !reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) {
+                    notify("Crossover reconnected")
+                }
+            }
             if previous != .connected { sessionSubstate = .standby }
+            disconnectStartedAt = nil
+            disconnectNotificationSent = false
         } else {
             sessionSubstate = nil
         }
@@ -560,13 +916,15 @@ final class ConnectionMonitor: ObservableObject {
             autoReconnectTask?.cancel()
             autoReconnectTask = nil
             autoReconnectAttempts = 0
+        } else if next == .unknown {
+            autoReconnectTask?.cancel()
+            autoReconnectTask = nil
         }
-        guard shouldNotify(previous: previous, next: next, replay: replay) else { return }
-        notify(next == .connected ? "Crossover reconnected" : configuredDevicesEmpty ? "Crossover turned off" : "Crossover disconnected")
     }
 
     func reconnectNow() {
-        reconnect()
+        guard !reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) else { return }
+        reconnect(trigger: .manual, attempt: 1)
     }
 
     private func handleDisconnect(replay: Bool = false, timestamp: Date? = nil) {
@@ -574,8 +932,12 @@ final class ConnectionMonitor: ObservableObject {
             update(to: .disconnected, replay: true, timestamp: timestamp)
             return
         }
+        if reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) {
+            update(to: .disconnected, scheduleDisconnectNotice: false)
+            return
+        }
         let elapsed = lastReconnectAt.map { Date().timeIntervalSince($0) }
-        if reconnectDecision(autoEnabled: autoReconnectEnabled, configuredDevicesEmpty: configuredDevicesEmpty, attempts: autoReconnectAttempts, secondsSinceReconnect: elapsed, timerExpired: false) == .ignoreDisconnect { return }
+        if !reconnectPending && reconnectDecision(autoEnabled: autoReconnectEnabled, configuredDevicesEmpty: configuredDevicesEmpty, attempts: autoReconnectAttempts, secondsSinceReconnect: elapsed, timerExpired: false) == .ignoreDisconnect { return }
         update(to: .disconnected)
     }
 
@@ -583,6 +945,33 @@ final class ConnectionMonitor: ObservableObject {
         let content = UNMutableNotificationContent()
         content.title = title
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: content, trigger: nil))
+    }
+
+    private var elapsedSinceDisconnect: TimeInterval? {
+        disconnectStartedAt.map { Date().timeIntervalSince($0) }
+    }
+
+    private func scheduleDisconnectNotification() {
+        guard let startedAt = disconnectStartedAt else { return }
+        disconnectNotificationTask?.cancel()
+        disconnectNotificationTask = Task { @MainActor in
+            try? await Task.sleep(for: .seconds(20))
+            guard !Task.isCancelled, state == .disconnected, disconnectStartedAt == startedAt else { return }
+            if delayedDisconnectNotice(elapsed: Date().timeIntervalSince(startedAt), recovered: false,
+                                       disconnectWasSent: disconnectNotificationSent) == .sendDisconnect,
+               !reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) {
+                disconnectNotificationSent = true
+                notify(configuredDevicesEmpty ? "Crossover turned off" : "Crossover disconnected")
+            }
+            disconnectNotificationTask = nil
+        }
+    }
+
+    private func logGaveUp(trigger: ReconnectTrigger, attempt: Int) {
+        guard !gaveUpLoggedForDisconnect else { return }
+        gaveUpLoggedForDisconnect = true
+        reconnectLog.append(event: "gave_up", trigger: trigger, attempt: attempt,
+                            secondsSinceDisconnect: elapsedSinceDisconnect)
     }
 
     private func updateOverlay() {
@@ -632,7 +1021,10 @@ final class ConnectionMonitor: ObservableObject {
 
     func resetZoneColors() { zoneColors = .defaults }
 
-    private func reconnect() {
+    private func reconnect(trigger: ReconnectTrigger, attempt: Int) {
+        if trigger == .manual && !reconnectPending { gaveUpLoggedForDisconnect = false }
+        reconnectTrigger = trigger
+        reconnectAttempt = attempt
         reconnectPending = true
         reconnectStatus = "[RECONNECTING...]"
         lastReconnectAt = Date()
@@ -643,15 +1035,23 @@ final class ConnectionMonitor: ObservableObject {
             reconnectPending = false
             reconnectTimeoutTask = nil
             reconnectStatus = "[FAILED]"
-            update(to: .disconnected)
+            if trigger == .manual || attempt >= 3 { logGaveUp(trigger: trigger, attempt: attempt) }
         }
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/killall")
         process.arguments = ["-KILL", "UniversalControl"]
-        try? process.run()
+        reconnectLog.append(event: "kill", trigger: trigger, attempt: attempt, secondsSinceDisconnect: elapsedSinceDisconnect)
+        do {
+            try process.run()
+        } catch {
+            reconnectPending = false
+            reconnectStatus = "[FAILED]"
+            if trigger == .manual || attempt >= 3 { logGaveUp(trigger: trigger, attempt: attempt) }
+        }
     }
 
     private func beginAutoReconnect() {
+        guard !reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) else { return }
         guard autoReconnectEnabled, !configuredDevicesEmpty, state == .disconnected else { return }
         guard autoReconnectTask == nil else { return }
         let decision = reconnectDecision(autoEnabled: autoReconnectEnabled, configuredDevicesEmpty: configuredDevicesEmpty, attempts: autoReconnectAttempts, secondsSinceReconnect: nil, timerExpired: false)
@@ -662,14 +1062,15 @@ final class ConnectionMonitor: ObservableObject {
         autoReconnectTask?.cancel()
         autoReconnectTask = Task { @MainActor in
             try? await Task.sleep(for: .seconds(delay))
-            guard !Task.isCancelled, autoReconnectEnabled, !configuredDevicesEmpty, state == .disconnected else { return }
+            guard !Task.isCancelled, autoReconnectEnabled, !configuredDevicesEmpty, state == .disconnected,
+                  !reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) else { return }
             let elapsed = lastReconnectAt.map { Date().timeIntervalSince($0) }
             switch reconnectDecision(autoEnabled: autoReconnectEnabled, configuredDevicesEmpty: configuredDevicesEmpty, attempts: autoReconnectAttempts, secondsSinceReconnect: elapsed, timerExpired: true) {
             case .ignoreDisconnect:
                 scheduleAutoReconnect(after: max(0.1, 10 - (elapsed ?? 0)))
             case .reconnect:
                 autoReconnectAttempts += 1
-                reconnect()
+                reconnect(trigger: .auto, attempt: autoReconnectAttempts)
                 if autoReconnectAttempts < 3 {
                     let next = reconnectDecision(autoEnabled: autoReconnectEnabled, configuredDevicesEmpty: configuredDevicesEmpty, attempts: autoReconnectAttempts, secondsSinceReconnect: nil, timerExpired: false)
                     if case .schedule(let nextDelay) = next { scheduleAutoReconnect(after: nextDelay) }
@@ -680,7 +1081,10 @@ final class ConnectionMonitor: ObservableObject {
                 autoReconnectTask = nil
                 reconnectPending = false
                 reconnectStatus = "[FAILED]"
-                notify("Crossover auto-reconnect failed")
+                logGaveUp(trigger: .auto, attempt: autoReconnectAttempts)
+                if !reconnectSuppressed(asleep: !inactivitySources.isEmpty, now: Date(), wakeGraceUntil: wakeGraceUntil) {
+                    notify("Crossover auto-reconnect failed")
+                }
             case .disabled, .schedule:
                 autoReconnectTask = nil
             }
